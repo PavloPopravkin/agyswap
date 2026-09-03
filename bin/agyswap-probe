@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""agyswap probe - accurate walls for the Antigravity account fleet.
+
+The wrapper walls an account only after a call fails with a quota banner. This
+prober is the reliable path: it reads `agy -p /quota` per slot (a metadata turn,
+no model tokens), and when a basket is spent it writes the wall file with the
+REAL reset time from the quota panel, so the account leaves the rotation cleanly
+and returns exactly when Google refills it. A recovered slot clears its own wall.
+
+Run it from cron every 10 minutes. Wall files: line 1 = reset epoch, line 2 = note.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+BASE = os.environ.get("AGYSWAP_DIR", os.path.join(HOME, ".agyswap"))
+SLOTS = os.path.join(BASE, "slots")
+STATE = os.path.join(BASE, "state")
+AUTH_REL = os.path.join(".gemini", "antigravity-cli", "jetski_state.pbtxt")
+QUOTA_CACHE = os.path.join(STATE, "quota.json")
+DAILY_STATE = os.path.join(STATE, "daily.json")
+
+THRESHOLD_PCT = float(os.environ.get("AGYSWAP_WALL_PCT", 3))       # wall at or below this remaining %
+DAILY_BUDGET_PCT = float(os.environ.get("AGYSWAP_DAILY_BUDGET_PCT", 14))  # weekly points per UTC day
+PROBE_TIMEOUT = int(os.environ.get("AGYSWAP_PROBE_TIMEOUT", 60))
+
+
+def log(msg):
+    print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}")
+
+
+def find_agy():
+    explicit = os.environ.get("AGYSWAP_AGY")
+    if explicit:
+        return explicit
+    self_dir = os.path.dirname(os.path.realpath(__file__))
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d, "agy")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            if os.path.dirname(os.path.realpath(cand)) == self_dir:
+                continue  # that is our own wrapper installed as `agy`
+            return cand
+    for cand in (os.path.join(HOME, ".local/bin/agy"), "/usr/local/bin/agy", "/opt/homebrew/bin/agy"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+AGY = find_agy()
+
+
+def parse_iso(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def read_quota(slot_home):
+    """Return (gemini, claude_gpt) dicts: {window: (remaining_pct, reset_epoch)}."""
+    env = dict(os.environ, HOME=slot_home)
+    env.pop("AGYSWAP_SLOT", None)
+    try:
+        out = subprocess.run([AGY, "-p", "/quota", "--output-format", "json"],
+                             env=env, capture_output=True, text=True,
+                             timeout=PROBE_TIMEOUT).stdout
+    except Exception as e:
+        log(f"  quota probe failed: {e}")
+        return None, None
+    try:
+        d = json.loads(out.strip())
+    except Exception:
+        try:
+            d = json.loads(out[out.index("{"): out.rindex("}") + 1])
+        except Exception:
+            return None, None
+    gemini, cg = {}, {}
+    for line in d.get("response", "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        head = parts[0].strip()
+        # Two independent baskets per account: "Gemini Models" and
+        # "Claude and GPT models" (Claude Sonnet/Opus, GPT-OSS).
+        target = gemini if head.startswith("Gemini") else (cg if head.startswith("Claude") else None)
+        if target is None:
+            continue
+        window, pct, reset = parts[1].strip(), parts[2].strip().rstrip("%"), parts[3].strip()
+        try:
+            target[window] = (float(pct), parse_iso(reset))
+        except Exception:
+            pass
+    return (gemini or None), cg
+
+
+def write_wall(path, until, note):
+    with open(path, "w") as f:
+        f.write(f"{int(until)}\n{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {note}\n")
+
+
+def clear_wall(path, why):
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+            log(why)
+        except OSError:
+            pass
+
+
+def apply_basket(slot, quota, wall_path, label):
+    """Wall while any window of this basket is spent; clear once it refills."""
+    spent = [(pct, reset) for (pct, reset) in quota.values() if pct <= THRESHOLD_PCT and reset]
+    lowest = min(p for p, _ in quota.values())
+    if spent:
+        until = int(min(r for _, r in spent)) + 120
+        write_wall(wall_path, until, f"slot{slot} {label} walled until "
+                                     f"{datetime.fromtimestamp(until, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        log(f"slot{slot}: {label} WALLED until "
+            f"{datetime.fromtimestamp(until, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} "
+            f"(remaining {lowest:.0f}%)")
+    else:
+        clear_wall(wall_path, f"slot{slot}: {label} healthy ({lowest:.0f}% left); wall cleared")
+
+
+def weekly_remaining(quota):
+    for window, (pct, _) in quota.items():
+        label = "".join(window.lower().split()).replace("-", "")
+        if "week" in label or label in {"1w", "7d", "7day", "7days", "168h", "168hour", "168hours"}:
+            return pct
+    return None
+
+
+def update_daily_pace(slot, weekly_pct, daily):
+    """Spend at most DAILY_BUDGET_PCT of the weekly quota per UTC day.
+
+    Without this a fresh weekly bucket is burned in a day and the account is dark
+    for the rest of the week. The wall is soft: the wrapper bypasses it when no
+    other slot is free.
+    """
+    if DAILY_BUDGET_PCT <= 0:
+        return False
+    now = datetime.now(timezone.utc)
+    day = now.date().isoformat()
+    key = f"slot{slot}"
+    wall = os.path.join(STATE, f"wall-pace-{slot}")
+    entry = daily.get(key)
+    start = None
+    if isinstance(entry, dict) and entry.get("date") == day:
+        try:
+            start = float(entry["weekly_start_pct"])
+        except (KeyError, TypeError, ValueError):
+            start = None
+    if start is None:
+        daily[key] = {"date": day, "weekly_start_pct": weekly_pct}
+        clear_wall(wall, f"slot{slot}: new UTC day ({weekly_pct:.0f}% weekly left); pace wall cleared")
+        return True
+    spent = start - weekly_pct
+    if spent >= DAILY_BUDGET_PCT:
+        midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+        write_wall(wall, midnight.timestamp(),
+                   f"slot{slot} pace-walled until {midnight.strftime('%Y-%m-%dT%H:%M:%SZ')} "
+                   f"(spent {spent:.0f} of {DAILY_BUDGET_PCT:g} points today)")
+        log(f"slot{slot}: PACE-WALLED until {midnight.strftime('%Y-%m-%dT%H:%M:%SZ')} "
+            f"(spent {spent:.0f} of {DAILY_BUDGET_PCT:g} points today)")
+    else:
+        clear_wall(wall, f"slot{slot}: spent {spent:.0f} of {DAILY_BUDGET_PCT:g} points today; pace wall cleared")
+    return False
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else default
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def main():
+    if not AGY:
+        print("agyswap-probe: real agy binary not found - set AGYSWAP_AGY", file=sys.stderr)
+        return 2
+    os.makedirs(STATE, exist_ok=True)
+    if not os.path.isdir(SLOTS):
+        print(f"agyswap-probe: no slots directory {SLOTS}", file=sys.stderr)
+        return 2
+
+    daily = load_json(DAILY_STATE, {})
+    dirty = False
+    snapshot = {}
+    slots = sorted((d for d in os.listdir(SLOTS)
+                    if d.startswith("slot") and os.path.exists(os.path.join(SLOTS, d, AUTH_REL))),
+                   key=lambda d: int(d[4:]) if d[4:].isdigit() else 0)
+    if not slots:
+        print(f"agyswap-probe: no authenticated slots in {SLOTS}", file=sys.stderr)
+        return 1
+
+    for d in slots:
+        n = d[len("slot"):]
+        gemini, cg = read_quota(os.path.join(SLOTS, d))
+        if not gemini:
+            log(f"slot{n}: quota unreadable; state left unchanged")
+            continue
+        snapshot[d] = {
+            "gemini": {w: {"remaining_pct": p, "reset": r} for w, (p, r) in gemini.items()},
+            "claude_gpt": {w: {"remaining_pct": p, "reset": r} for w, (p, r) in (cg or {}).items()},
+        }
+        apply_basket(n, gemini, os.path.join(STATE, f"wall-{n}"), "Gemini")
+        if cg:
+            apply_basket(n, cg, os.path.join(STATE, f"wall-cg-{n}"), "Claude/GPT")
+        weekly = weekly_remaining(gemini)
+        if weekly is not None:
+            dirty = update_daily_pace(n, weekly, daily) or dirty
+        low = min(p for p, _ in gemini.values())
+        log(f"slot{n}: gemini {low:.0f}% left"
+            + (f", claude/gpt {min(p for p, _ in cg.values()):.0f}% left" if cg else ""))
+
+    if dirty:
+        save_json(DAILY_STATE, daily)
+    snapshot["_probed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    save_json(QUOTA_CACHE, snapshot)
+    if "--json" in sys.argv:
+        print(json.dumps(snapshot, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

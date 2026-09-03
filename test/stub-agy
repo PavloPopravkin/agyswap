@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Stand-in for the real `agy` binary, used by test/smoke.sh.
+# It identifies the account by the HOME it was launched under, so the rotation,
+# the walls and the quota prober can be exercised without spending any quota.
+#
+#   STUB_EXHAUSTED=slot2         slot2 answers with a quota error
+#   STUB_QUOTA_slot1="4 90"      slot1 reports 4% Gemini, 90% Claude/GPT left
+set -u
+slot=$(basename "$HOME")
+
+if [ "${1:-}" = "-p" ] && [ "${2:-}" = "/quota" ]; then
+  var="STUB_QUOTA_$slot"
+  read -r gem cg <<< "${!var:-80 80}"
+  python3 - "$gem" "$cg" <<'PY'
+import json, sys
+from datetime import datetime, timedelta, timezone
+gem, cg = sys.argv[1], sys.argv[2]
+now = datetime.now(timezone.utc)
+five = (now + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+week = (now + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+rows = [f"Gemini Models\t5 hours\t{gem}%\t{five}",
+        f"Gemini Models\tWeekly\t{gem}%\t{week}",
+        f"Claude and GPT models\t5 hours\t{cg}%\t{five}",
+        f"Claude and GPT models\tWeekly\t{cg}%\t{week}"]
+print(json.dumps({"response": "\n".join(rows)}))
+PY
+  exit 0
+fi
+
+echo "stub-agy ran on $slot args=$*"
+if [ "${STUB_EXHAUSTED:-}" = "$slot" ]; then
+  echo '{"type":"result","error":"RESOURCE_EXHAUSTED: quota exceeded for this account"}' >&2
+  exit 1
+fi
+exit 0

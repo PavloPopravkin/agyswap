@@ -1,0 +1,3 @@
+# Keep the walls honest: read /quota per account every 10 minutes.
+# A probe is a metadata turn - it costs no model tokens.
+*/10 * * * * $HOME/.local/bin/agyswap probe >> $HOME/.agyswap/state/probe.log 2>&1

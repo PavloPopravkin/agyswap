@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# agyswap - round-robin over independent Antigravity (Google AI Pro) accounts.
+#
+# Each Google account has its own weekly and 5-hour quota for the Antigravity
+# CLI. When one runs out every call routed to it fails, and nothing tells the
+# caller to switch. agyswap sits in front of the real `agy` binary, picks a live
+# account per call by swapping HOME (agy keeps its auth under
+# $HOME/.gemini/antigravity-cli), records a wall when a call reports quota
+# exhaustion, and skips walled accounts until their reset passes.
+#
+# Accounts live one per directory: $AGYSWAP_DIR/slots/slotN/ is a HOME whose
+# .gemini/antigravity-cli/jetski_state.pbtxt holds that account's auth. Add an
+# account with `agyswap login <n>` and it joins the rotation with no config edit.
+#
+# With no authenticated slot the wrapper is transparent and execs the real CLI.
+set -u
+
+AGYSWAP_DIR="${AGYSWAP_DIR:-$HOME/.agyswap}"
+SLOTS_DIR="$AGYSWAP_DIR/slots"
+STATE_DIR="$AGYSWAP_DIR/state"
+AUTH_REL=".gemini/antigravity-cli/jetski_state.pbtxt"
+COUNTER="$STATE_DIR/rr-counter"
+LOG="$STATE_DIR/agyswap.log"
+QUOTA_CACHE="$STATE_DIR/quota.json"
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SELF_NAME="$(basename "$0")"
+VERSION="1.0.0"
+
+mkdir -p "$SLOTS_DIR" "$STATE_DIR" 2>/dev/null || true
+
+die() { echo "agyswap: $*" >&2; exit 2; }
+log_line() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
+notify() { [ -n "${AGYSWAP_NOTIFY_CMD:-}" ] && "$SHELL" -c "$AGYSWAP_NOTIFY_CMD" "agyswap" "$1" >/dev/null 2>&1 || true; }
+
+# --- locate the real agy binary ----------------------------------------------
+# Explicit env wins. Otherwise walk PATH and take the first `agy` that is not
+# this wrapper, so agyswap can be installed as `agy` earlier in PATH.
+resolve_real() {
+  if [ -n "${AGYSWAP_AGY:-}" ]; then printf '%s' "$AGYSWAP_AGY"; return; fi
+  local d cand
+  IFS=: read -r -a _p <<< "$PATH"
+  for d in "${_p[@]}"; do
+    cand="$d/agy"
+    [ -x "$cand" ] || continue
+    [ "$(readlink -f "$cand" 2>/dev/null)" = "$SELF" ] && continue
+    printf '%s' "$cand"; return
+  done
+  for cand in "$HOME/.local/bin/agy" /usr/local/bin/agy /opt/homebrew/bin/agy; do
+    [ -x "$cand" ] && [ "$(readlink -f "$cand" 2>/dev/null)" != "$SELF" ] && { printf '%s' "$cand"; return; }
+  done
+  printf ''
+}
+REAL="$(resolve_real)"
+
+# --- slots and walls ----------------------------------------------------------
+discover_slots() {
+  local d s out=""
+  for d in "$SLOTS_DIR"/slot*/; do
+    [ -f "$d/$AUTH_REL" ] || continue
+    s=$(basename "$d"); out="$out ${s#slot}"
+  done
+  printf '%s' "${out# }"
+}
+
+# A wall file holds the reset epoch on line 1 and a human note on line 2.
+walled() {
+  [ -f "$1" ] || return 1
+  local u; u=$(head -n1 "$1" 2>/dev/null)
+  case "$u" in ''|*[!0-9]*) return 1;; esac
+  [ "$u" -gt "$(date +%s)" ]
+}
+
+# Antigravity meters two independent baskets per account: "Gemini Models" and
+# "Claude and GPT models". A call for the second basket must ignore the Gemini
+# walls and only respect its own, so a spent Gemini quota does not hide a full
+# Claude quota on the same account.
+detect_bucket() {
+  local prev="" a
+  BUCKET=gemini
+  for a in "$@"; do
+    case "$prev" in --model|-m) case "$a" in claude-*|gpt-*) BUCKET=cg ;; esac ;; esac
+    case "$a" in --model=claude-*|--model=gpt-*) BUCKET=cg ;; esac
+    prev="$a"
+  done
+}
+bucket_wall() { if [ "${BUCKET:-gemini}" = cg ]; then printf '%s' "$STATE_DIR/wall-cg-$1"; else printf '%s' "$STATE_DIR/wall-$1"; fi; }
+pace_wall()   { printf '%s' "$STATE_DIR/wall-pace-$1"; }
+
+alive_count() {
+  local n=0 d s
+  for d in "$SLOTS_DIR"/slot*/; do
+    [ -f "$d/$AUTH_REL" ] || continue
+    s=$(basename "$d"); s=${s#slot}
+    walled "$(bucket_wall "$s")" && continue
+    n=$((n+1))
+  done
+  echo "$n"
+}
+
+# --- run one call under a slot, and wall that slot if it reports exhaustion ---
+run_slot() {
+  local slot="$1"; shift
+  local o e rc
+  o=$(mktemp) || { HOME="$SLOTS_DIR/slot$slot" exec "$REAL" "$@"; }
+  e=$(mktemp) || { rm -f "$o"; HOME="$SLOTS_DIR/slot$slot" exec "$REAL" "$@"; }
+  HOME="$SLOTS_DIR/slot$slot" "$REAL" "$@" > >(tee "$o") 2> >(tee "$e" >&2)
+  rc=$?
+  wait
+
+  local txt; txt=$(tail -c 20000 "$o" 2>/dev/null; tail -c 20000 "$e" 2>/dev/null)
+  rm -f "$o" "$e"
+
+  # Wall only on a quota marker inside agy's OWN "error" field, never anywhere in
+  # the model's answer. A code review whose text merely discusses a rate limit
+  # would otherwise wall a perfectly healthy account - that happened here once.
+  # This reactive wall is a backstop; `agyswap probe` is the accurate path.
+  local errfield until=""
+  errfield=$(printf '%s' "$txt" | grep -oE '"error"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1)
+  case "$errfield" in
+    *RESOURCE_EXHAUSTED*|*quota*|*Quota*|*'rate limit'*|*'rate-limit'*|*429*|*'usage limit'*|*'out of quota'*)
+      local when
+      when=$(printf '%s' "$txt" | grep -oiE "reset[s]?( (at|in))? +[0-9][^.,|)]{1,24}" | head -n1 | sed -E 's/^reset[s]?( (at|in))? +//')
+      if [ -n "$when" ]; then
+        until=$(date -d "$when" +%s 2>/dev/null || true)
+        if [ -n "$until" ] && [ "$until" -le "$(date +%s)" ]; then
+          until=$(date -d "tomorrow $when" +%s 2>/dev/null || true)
+        fi
+      fi
+      # Without a parseable reset, assume the 5-hour window plus a margin: short
+      # enough that a real weekly cap re-walls on the next call instead of being
+      # masked for days.
+      if [ -z "$until" ] || [ "$until" -le "$(date +%s)" ]; then until=$(( $(date +%s) + 5*3600 + 600 )); fi
+      until=$(( until + 120 ))
+      ;;
+  esac
+
+  if [ -n "$until" ]; then
+    local wall was=0; wall=$(bucket_wall "$slot")
+    walled "$wall" && was=1
+    { echo "$until"; echo "$(date -u +%FT%TZ) slot$slot walled until $(date -d "@$until" -u +%FT%TZ)"; } > "$wall"
+    log_line "slot=$slot WALLED until $(date -d "@$until" -u +%FT%TZ) bucket=${BUCKET:-gemini}"
+    if [ "$was" = 0 ]; then
+      local alive; alive=$(alive_count)
+      if [ "$alive" -eq 0 ]; then
+        notify "all Antigravity accounts are out of quota (slot$slot until $(date -d "@$until" -u '+%d.%m %H:%M UTC'))"
+      else
+        notify "slot$slot out of quota until $(date -d "@$until" -u '+%d.%m %H:%M UTC'); live accounts: $alive"
+      fi
+    fi
+  fi
+  exit $rc
+}
+
+# --- pick a slot and go -------------------------------------------------------
+do_run() {
+  [ -n "$REAL" ] || die "real agy binary not found - set AGYSWAP_AGY=/path/to/agy"
+  local slots; slots=$(discover_slots)
+  [ -n "$slots" ] || exec "$REAL" "$@"      # nothing set up yet: stay transparent
+  detect_bucket "$@"
+
+  # A pinned slot wins when it is usable (useful for reproducing a session).
+  if [ -n "${AGYSWAP_SLOT:-}" ]; then
+    local fs=${AGYSWAP_SLOT#slot}
+    if [ -f "$SLOTS_DIR/slot$fs/$AUTH_REL" ] && ! walled "$(bucket_wall "$fs")"; then
+      log_line "slot=$fs (pinned) argv=${1:-}"
+      run_slot "$fs" "$@"
+    fi
+  fi
+
+  local ctr
+  ctr=$( ( flock 9; c=$(( $(cat "$COUNTER" 2>/dev/null || echo 0) + 1 )); echo $c > "$COUNTER"; echo $c ) 9>"$COUNTER.lock" )
+  local arr=($slots) n=${#arr[@]} pick="" i s
+  for ((i=0; i<n; i++)); do
+    s=${arr[$(( (ctr+i) % n ))]}
+    walled "$(bucket_wall "$s")" && continue
+    [ "${BUCKET:-gemini}" = gemini ] && walled "$(pace_wall "$s")" && continue
+    pick=$s; break
+  done
+  # Every slot is paced out or walled: still send the call rather than turning a
+  # soft budget into a refusal. Pacing smooths spend, it does not cap it.
+  if [ -z "$pick" ]; then
+    for ((i=0; i<n; i++)); do
+      s=${arr[$(( (ctr+i) % n ))]}
+      walled "$(bucket_wall "$s")" && continue
+      pick=$s; break
+    done
+    [ -n "$pick" ] || pick=${arr[$(( ctr % n ))]}
+    log_line "slot=$pick BYPASS (no unwalled slot left)"
+  fi
+  log_line "slot=$pick argv=${1:-}"
+  run_slot "$pick" "$@"
+}
+
+# --- subcommands --------------------------------------------------------------
+human_left() {
+  local u=$1 now s
+  now=$(date +%s); s=$(( u - now ))
+  [ "$s" -le 0 ] && { printf 'expired'; return; }
+  printf '%dh%02dm' $(( s/3600 )) $(( (s%3600)/60 ))
+}
+
+wall_state() {
+  local f=$1
+  if walled "$f"; then printf 'until %s (%s)' "$(date -d "@$(head -n1 "$f")" -u '+%d.%m %H:%M UTC')" "$(human_left "$(head -n1 "$f")")"
+  else printf 'free'; fi
+}
+
+cmd_list() {
+  local slots; slots=$(discover_slots)
+  [ -n "$slots" ] || { echo "no authenticated slots in $SLOTS_DIR - run: agyswap login 1"; return 0; }
+  printf '%-6s %-28s %-28s %s\n' SLOT "GEMINI QUOTA" "CLAUDE/GPT QUOTA" "PACE"
+  local s
+  for s in $slots; do
+    printf '%-6s %-28s %-28s %s\n' "slot$s" \
+      "$(wall_state "$STATE_DIR/wall-$s")" \
+      "$(wall_state "$STATE_DIR/wall-cg-$s")" \
+      "$(wall_state "$STATE_DIR/wall-pace-$s")"
+  done
+  [ -f "$QUOTA_CACHE" ] && echo && echo "last probe: $(date -r "$QUOTA_CACHE" -u '+%F %H:%M UTC') ($QUOTA_CACHE)"
+  return 0
+}
+
+cmd_login() {
+  local n=${1:-}
+  [ -n "$n" ] || die "usage: agyswap login <slot-number>"
+  [ -n "$REAL" ] || die "real agy binary not found - set AGYSWAP_AGY=/path/to/agy"
+  n=${n#slot}
+  local home="$SLOTS_DIR/slot$n"
+  mkdir -p "$home"
+  echo "Starting agy under HOME=$home"
+  echo "Sign in with the Google account you want on slot$n, then exit the CLI."
+  HOME="$home" "$REAL"
+  if [ -f "$home/$AUTH_REL" ]; then echo "slot$n authenticated."; else echo "slot$n has no auth state yet - run again and complete the sign-in." >&2; return 1; fi
+}
+
+cmd_unwall() {
+  local t=${1:-}
+  [ -n "$t" ] || die "usage: agyswap unwall <slot-number|all>"
+  if [ "$t" = all ]; then rm -f "$STATE_DIR"/wall-* && echo "all walls cleared"; return 0; fi
+  t=${t#slot}; rm -f "$STATE_DIR/wall-$t" "$STATE_DIR/wall-cg-$t" "$STATE_DIR/wall-pace-$t"
+  echo "slot$t walls cleared"
+}
+
+cmd_help() {
+  cat <<EOF
+agyswap $VERSION - multi-account rotation for the Antigravity CLI
+
+  agyswap <agy args...>        run agy on the next live account (also: agyswap run -- ...)
+  agyswap login <n>            authenticate account slot <n>
+  agyswap list                 slots and their wall state
+  agyswap probe                read /quota per account, wall the spent ones
+  agyswap unwall <n|all>       clear walls by hand
+  agyswap which                show the real agy binary and the slots directory
+  agyswap help
+
+Install it as \`agy\` earlier in PATH and every existing script rotates untouched.
+
+Environment
+  AGYSWAP_DIR         state and slots (default ~/.agyswap)
+  AGYSWAP_AGY         path to the real agy binary (default: first agy in PATH that is not agyswap)
+  AGYSWAP_SLOT        pin one slot for this call
+  AGYSWAP_NOTIFY_CMD  shell command called with a message when an account is walled
+  AGYSWAP_DAILY_BUDGET_PCT  weekly-quota points a slot may spend per UTC day (probe; default 14)
+EOF
+}
+
+case "${1:-}" in
+  ""|help|-h|--help)
+      # `agy` with no args means an interactive session; only bare `agyswap` prints help.
+      if [ "$SELF_NAME" = agy ]; then do_run "$@"; else cmd_help; fi ;;
+  list|ls|status) shift; cmd_list "$@" ;;
+  login)          shift; cmd_login "$@" ;;
+  unwall)         shift; cmd_unwall "$@" ;;
+  probe)          shift; exec "$(dirname "$SELF")/agyswap-probe" "$@" ;;
+  which)          echo "real agy: ${REAL:-<not found>}"; echo "slots:    $SLOTS_DIR"; echo "state:    $STATE_DIR" ;;
+  version|--version) echo "agyswap $VERSION" ;;
+  run)            shift; [ "${1:-}" = -- ] && shift; do_run "$@" ;;
+  *)              do_run "$@" ;;
+esac
